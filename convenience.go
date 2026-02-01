@@ -6,7 +6,15 @@ import (
 )
 
 // Sync is the simplest way to use Courier for polling-based synchronization.
-// It creates a coordinator with sensible defaults and production-ready resilience.
+//
+// The coordinator runs in a loop:
+//  1. Call fetch() to get records
+//  2. For each record, call process()
+//  3. Call mark() with successful records
+//  4. Wait for the interval (default: 5 seconds)
+//  5. Repeat until context is cancelled
+//
+// Use WithInterval() to change how often it runs.
 //
 // Example:
 //
@@ -14,8 +22,9 @@ import (
 //	    fetchRecords,    // func(ctx) ([]T, error)
 //	    processRecord,   // func(ctx, T) error
 //	    markAsSynced,    // func(ctx, []T) error
+//	    courier.WithInterval(5*time.Second), // optional: defaults to 5s
 //	)
-//	coordinator.Start(ctx)
+//	coordinator.Start(ctx) // runs forever until ctx is cancelled
 func Sync[T any](
 	fetch func(ctx context.Context) ([]T, error),
 	process func(ctx context.Context, record T) error,
@@ -172,12 +181,22 @@ func WithSlowPolling() PollingOption {
 	return WithInterval(30 * time.Second)
 }
 
-// RunOnce executes a single sync cycle without starting a coordinator.
-// Useful for testing, cron jobs, or manual triggers.
+// RunOnce executes a single sync cycle and returns immediately.
+// Unlike Sync(), it does NOT run in a loop - it runs exactly once.
+//
+// Perfect for:
+//   - Cron jobs (run every minute via cron, not an internal loop)
+//   - Manual triggers (button click, API call)
+//   - Testing
 //
 // Example:
 //
+//	// In a cron job that runs every minute:
 //	err := courier.RunOnce(ctx, fetchRecords, processRecord, markAsSynced)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	// Done! Process exits.
 func RunOnce[T any](
 	ctx context.Context,
 	fetch func(ctx context.Context) ([]T, error),

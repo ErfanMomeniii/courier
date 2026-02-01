@@ -72,6 +72,7 @@ package main
 import (
     "context"
     "log"
+    "time"
 
     "github.com/erfanmomeniii/courier"
 )
@@ -82,12 +83,22 @@ type Event struct {
 }
 
 func main() {
-    // That's it! Just 3 functions:
+    // Just 3 functions + configure how often to run:
     coordinator := courier.Sync(
         fetchEvents,    // 1. How to get records
         processEvent,   // 2. What to do with each record
         markAsSynced,   // 3. How to mark records as done
+        courier.WithInterval(5*time.Second), // Run every 5 seconds
     )
+
+    // coordinator.Start() runs FOREVER in a loop:
+    //   1. Call fetchEvents() to get records
+    //   2. For each record, call processEvent()
+    //   3. Call markAsSynced() with successful records
+    //   4. Wait 5 seconds
+    //   5. Repeat from step 1...
+    //
+    // Stops when context is cancelled (Ctrl+C)
 
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
@@ -101,21 +112,66 @@ func fetchEvents(ctx context.Context) ([]Event, error) {
 }
 
 func processEvent(ctx context.Context, event Event) error {
-    // Do something with each event
+    // Do something with each event (called once per record)
     return sendToKafka(event)
 }
 
 func markAsSynced(ctx context.Context, events []Event) error {
-    // Mark events as processed
+    // Mark events as processed (called once per batch)
     return db.Exec("UPDATE outbox SET synced_at = NOW() WHERE id IN (?)", ids(events))
 }
+```
+
+**How it works:**
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     coordinator.Start(ctx)                       │
+│                                                                  │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
+│   │ fetchEvents │───▶│processEvent │───▶│markAsSynced │──┐       │
+│   │  (get 100)  │    │ (each one)  │    │  (batch)    │  │       │
+│   └─────────────┘    └─────────────┘    └─────────────┘  │       │
+│         ▲                                                │       │
+│         │                 Wait 5 seconds                 │       │
+│         └────────────────────────────────────────────────┘       │
+│                                                                  │
+│   Runs forever until ctx is cancelled                            │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Common Configurations
+
+```go
+// Run every 5 seconds (default)
+coordinator := courier.Sync(fetch, process, mark, courier.WithInterval(5*time.Second))
+
+// Run every 100ms for low latency
+coordinator := courier.Sync(fetch, process, mark, courier.WithFastPolling())
+
+// Run every 30 seconds for less frequent sync
+coordinator := courier.Sync(fetch, process, mark, courier.WithSlowPolling())
 ```
 
 ### Add Retry with One Line
 
 ```go
 // Automatically retry failed records up to 5 times with exponential backoff
-coordinator := courier.SyncWithRetry(fetchEvents, processEvent, markAsSynced, 5)
+// Still runs every 5 seconds, but retries failures within each cycle
+coordinator := courier.SyncWithRetry(fetch, process, mark, 5,
+    courier.WithInterval(5*time.Second),
+)
+```
+
+### One-Shot Sync (No Loop)
+
+```go
+// Run exactly ONCE, then stop. Perfect for cron jobs or manual triggers.
+err := courier.RunOnce(ctx, fetchEvents, processEvent, markAsSynced)
+if err != nil {
+    log.Fatal(err)
+}
+// Done! No loop, no waiting.
 ```
 
 ### Add Full Resilience
@@ -127,18 +183,20 @@ applier := courier.ProcessFunc(processEvent)
 // Wrap with retry + DLQ + circuit breaker in one call
 resilientApplier, dlq := courier.ResilientApplier[Event](applier, nil)
 
-// Use it
-coordinator := courier.NewPollingCoordinator(source, resilientApplier)
+// Use it with a source
+source := courier.BatchSourceFunc[Event]{
+    FetchFunc: fetchEvents,
+    MarkFunc:  markAsSynced,
+}
+coordinator := courier.NewPollingCoordinator(source, resilientApplier,
+    courier.WithInterval(5*time.Second),
+)
 
-// Later, check what failed
+// Later, check what failed permanently
 failedRecords, _ := dlq.Receive(ctx, 100)
-```
-
-### One-Shot Sync (No Coordinator)
-
-```go
-// For cron jobs or manual triggers - just run once
-err := courier.RunOnce(ctx, fetchEvents, processEvent, markAsSynced)
+for _, f := range failedRecords {
+    log.Printf("Failed record: %v, error: %v", f.Record, f.Error)
+}
 ```
 
 ---

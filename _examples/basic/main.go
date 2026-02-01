@@ -47,11 +47,19 @@ func main() {
 	go addEventsInBackground(ctx)
 
 	// THE SIMPLE WAY: Just provide 3 functions!
+	//
+	// This creates a loop that:
+	//   1. Calls fetchEvents() to get unprocessed records
+	//   2. Calls processEvent() for each record
+	//   3. Calls markAsSynced() with successful records
+	//   4. Waits 2 seconds
+	//   5. Repeats forever until Ctrl+C
+	//
 	coordinator := courier.Sync(
 		fetchEvents,   // How to get records
 		processEvent,  // What to do with each record
 		markAsSynced,  // How to mark records as done
-		courier.WithInterval(2*time.Second),
+		courier.WithInterval(2*time.Second), // How often to check for new records
 	)
 
 	fmt.Println("Starting coordinator (Ctrl+C to stop)...")
