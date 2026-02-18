@@ -1,14 +1,10 @@
-// Example: Basic usage of courier with the simple API
-//
-// This example demonstrates how to use courier's convenience functions
-// to sync records with minimal boilerplate.
+// Basic example: Sync data from a "database" to "Kafka" with automatic retries
 //
 // Run with: go run main.go
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -18,119 +14,84 @@ import (
 	"github.com/erfanmomeniii/courier"
 )
 
-// Event represents an outbox event
+// Event represents a record in our outbox table
 type Event struct {
-	ID        string
-	EventType string
-	Payload   string
-	CreatedAt time.Time
+	ID      int
+	Type    string
+	Payload string
 }
 
-// Simple in-memory storage (simulates a database)
+// Simulated database (in real code, this would be your actual database)
 var (
-	mu      sync.Mutex
-	events  []Event
-	synced  = make(map[string]bool)
-	counter int
+	mu     sync.Mutex
+	outbox = []Event{
+		{ID: 1, Type: "order.created", Payload: `{"order_id": 100}`},
+		{ID: 2, Type: "user.signup", Payload: `{"user_id": 42}`},
+		{ID: 3, Type: "payment.received", Payload: `{"amount": 99.99}`},
+	}
+	sent = make(map[int]bool)
 )
 
 func main() {
-	fmt.Println("Courier Basic Example")
-	fmt.Println("=====================")
-	fmt.Println()
-
-	// Setup context with cancellation
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Simulate events being added in the background
-	go addEventsInBackground(ctx)
-
-	// THE SIMPLE WAY: Just provide 3 functions!
-	//
-	// This creates a loop that:
-	//   1. Calls fetchEvents() to get unprocessed records
-	//   2. Calls processEvent() for each record
-	//   3. Calls markAsSynced() with successful records
-	//   4. Waits 2 seconds
-	//   5. Repeats forever until Ctrl+C
-	//
-	coordinator := courier.Sync(
-		fetchEvents,   // How to get records
-		processEvent,  // What to do with each record
-		markAsSynced,  // How to mark records as done
-		courier.WithInterval(2*time.Second), // How often to check for new records
-	)
-
-	fmt.Println("Starting coordinator (Ctrl+C to stop)...")
+	fmt.Println("Starting courier (Ctrl+C to stop)...")
 	fmt.Println()
 
-	if err := coordinator.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Printf("Coordinator error: %v\n", err)
+	// Create a coordinator that:
+	// 1. Fetches unsent events every 2 seconds
+	// 2. Processes each event (prints it)
+	// 3. Marks events as sent
+	// 4. Retries up to 5 times on failure
+	coordinator := courier.SyncWithRetry(
+		fetchUnsent,
+		publishEvent,
+		markAsSent,
+		5, // retry up to 5 times
+		courier.WithInterval(2*time.Second),
+	)
+
+	if err := coordinator.Start(ctx); err != nil && err != context.Canceled {
+		fmt.Printf("Error: %v\n", err)
 	}
 
-	fmt.Println("\nDone!")
+	fmt.Println("Done!")
 }
 
-// fetchEvents retrieves unprocessed events
-func fetchEvents(ctx context.Context) ([]Event, error) {
+// fetchUnsent returns events that haven't been sent yet
+func fetchUnsent(ctx context.Context) ([]Event, error) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	var unsynced []Event
+	var unsent []Event
+	for _, e := range outbox {
+		if !sent[e.ID] {
+			unsent = append(unsent, e)
+		}
+	}
+
+	if len(unsent) > 0 {
+		fmt.Printf("Fetched %d unsent events\n", len(unsent))
+	}
+	return unsent, nil
+}
+
+// publishEvent sends an event to Kafka (simulated)
+func publishEvent(ctx context.Context, e Event) error {
+	fmt.Printf("  -> Publishing: [%d] %s\n", e.ID, e.Type)
+	// In real code: return kafka.Produce(e.Type, e.Payload)
+	return nil
+}
+
+// markAsSent marks events as sent in the database
+func markAsSent(ctx context.Context, events []Event) error {
+	mu.Lock()
+	defer mu.Unlock()
+
 	for _, e := range events {
-		if !synced[e.ID] {
-			unsynced = append(unsynced, e)
-			if len(unsynced) >= 10 {
-				break
-			}
-		}
+		sent[e.ID] = true
 	}
-	return unsynced, nil
-}
-
-// processEvent handles a single event
-func processEvent(ctx context.Context, event Event) error {
-	fmt.Printf("  ✓ Published: [%s] %s -> %s\n", event.ID, event.EventType, event.Payload)
+	fmt.Printf("Marked %d events as sent\n\n", len(events))
 	return nil
-}
-
-// markAsSynced marks events as processed
-func markAsSynced(ctx context.Context, records []Event) error {
-	mu.Lock()
-	defer mu.Unlock()
-
-	for _, r := range records {
-		synced[r.ID] = true
-	}
-	return nil
-}
-
-// addEventsInBackground simulates events being added to the outbox
-func addEventsInBackground(ctx context.Context) {
-	eventsToAdd := []struct{ typ, payload string }{
-		{"user.created", `{"id": 1, "name": "Alice"}`},
-		{"order.placed", `{"id": 100, "total": 99.99}`},
-		{"user.updated", `{"id": 1, "name": "Alice Smith"}`},
-		{"payment.received", `{"order_id": 100, "amount": 99.99}`},
-		{"order.shipped", `{"id": 100, "tracking": "ABC123"}`},
-	}
-
-	for i, e := range eventsToAdd {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(time.Duration(500+i*300) * time.Millisecond):
-			mu.Lock()
-			counter++
-			events = append(events, Event{
-				ID:        fmt.Sprintf("evt-%d", counter),
-				EventType: e.typ,
-				Payload:   e.payload,
-				CreatedAt: time.Now(),
-			})
-			mu.Unlock()
-			fmt.Printf("+ Added event: %s\n", e.typ)
-		}
-	}
 }

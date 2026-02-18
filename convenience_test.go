@@ -351,3 +351,117 @@ func TestWithSlowPolling(t *testing.T) {
 		t.Error("expected non-nil option")
 	}
 }
+
+// Example: Simulates a real outbox pattern use case
+func TestExample_OutboxPattern(t *testing.T) {
+	// Simulate an outbox table
+	type OutboxEvent struct {
+		ID      int
+		Topic   string
+		Payload string
+		Sent    bool
+	}
+
+	// Our "database"
+	outbox := []OutboxEvent{
+		{ID: 1, Topic: "orders", Payload: `{"order_id": 100}`, Sent: false},
+		{ID: 2, Topic: "orders", Payload: `{"order_id": 101}`, Sent: false},
+		{ID: 3, Topic: "users", Payload: `{"user_id": 1}`, Sent: false},
+	}
+
+	// Track what was "published"
+	var published []string
+
+	err := courier.RunOnce(context.Background(),
+		// Fetch unsent events from outbox
+		func(ctx context.Context) ([]OutboxEvent, error) {
+			var unsent []OutboxEvent
+			for _, e := range outbox {
+				if !e.Sent {
+					unsent = append(unsent, e)
+				}
+			}
+			return unsent, nil
+		},
+		// "Publish" each event to Kafka
+		func(ctx context.Context, e OutboxEvent) error {
+			published = append(published, e.Payload)
+			return nil
+		},
+		// Mark events as sent
+		func(ctx context.Context, events []OutboxEvent) error {
+			for _, e := range events {
+				for i := range outbox {
+					if outbox[i].ID == e.ID {
+						outbox[i].Sent = true
+					}
+				}
+			}
+			return nil
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify all events were published
+	if len(published) != 3 {
+		t.Errorf("expected 3 published, got %d", len(published))
+	}
+
+	// Verify all events are now marked as sent
+	for _, e := range outbox {
+		if !e.Sent {
+			t.Errorf("event %d should be marked as sent", e.ID)
+		}
+	}
+}
+
+// Example: Retry with permanent failure going to DLQ
+func TestExample_RetryWithDLQ(t *testing.T) {
+	var attempts int
+
+	// Create an applier that fails twice then succeeds
+	applier := courier.ProcessFunc(func(ctx context.Context, s string) error {
+		attempts++
+		if s == "always-fails" {
+			return errors.New("permanent failure")
+		}
+		if s == "fails-twice" && attempts <= 2 {
+			return errors.New("transient failure")
+		}
+		return nil
+	})
+
+	// Wrap with retry + DLQ
+	retryApplier := courier.NewRetryableApplier(applier, courier.RetryPolicy{
+		MaxAttempts:  3,
+		InitialDelay: time.Millisecond,
+		MaxDelay:     time.Millisecond,
+		Multiplier:   1,
+	})
+	dlqApplier, dlq := courier.WithDLQ(retryApplier)
+
+	// Process records
+	synced, failed, err := dlqApplier.Apply(context.Background(), []string{"ok", "fails-twice", "always-fails"})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// "ok" succeeds immediately, "fails-twice" succeeds after retries
+	if len(synced) != 2 {
+		t.Errorf("expected 2 synced, got %d", len(synced))
+	}
+
+	// "always-fails" goes to DLQ after all retries exhausted
+	if len(failed) != 0 {
+		t.Errorf("expected 0 failed (sent to DLQ), got %d", len(failed))
+	}
+
+	count, _ := dlq.Count(context.Background())
+	if count != 1 {
+		t.Errorf("expected 1 in DLQ, got %d", count)
+	}
+}
