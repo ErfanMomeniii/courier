@@ -237,4 +237,4 @@ func TestSync(t *testing.T) {
 
 ## License
 
-MIT
+MIT © [Erfan Momeni](https://github.com/ErfanMomeniii)
